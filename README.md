@@ -13,8 +13,9 @@ don't have to remember to do it.
 
 - **Works while games and programs are open.** Leave a game running, walk away, and the PC still goes to sleep.
 - **Pick one action:** Sleep, Hibernate, Shut down, Restart or Lock.
-- **You choose the time.** For example 30 minutes of no use.
-- **Random time (optional).** Pick a random wait between two numbers, in minutes or hours (for example 1 to 5 hours). It does not show how long is left.
+- **You choose the time,** in minutes or hours. For example 30 minutes of no use.
+- **Or a random time.** Pick a random wait between two numbers, in minutes or hours (for example 1 to 5 hours). It does not show how long is left.
+- **Says it in plain words:** "The PC will fall asleep after 30 minutes of no use."
 - **You choose what counts as using the PC:** Mouse, Keyboard and/or Xbox-style game controller. For example, tick only the mouse and typing won't stop it.
 - **OLED mode (optional).** A button that opens all the burn-in protection in one place, with the helpful options
   ticked for you: black screen saver after 5 minutes of no use, screen off after 10, screen off when the PC is
@@ -25,7 +26,9 @@ don't have to remember to do it.
 - **Night light that learns (optional, on at first).** Warmer screen colours in the evening, made by Idle Sleep
   itself (Windows 11 26H2 no longer lets programs switch Windows' own Night light). It comes on and goes off at the
   average of your last 7 times, counted from when your day starts (coming back after 5+ hours away), not from the
-  clock, so the PC's time zone doesn't matter. There's also a button to switch it straight away, and a strength slider.
+  clock, so the PC's time zone doesn't matter. There's also a button to switch it straight away, and a strength slider
+  on the same scale as Windows' Night light, starting at whatever Windows' own slider is set to (past about 60%,
+  Windows needs one setting changed first; the program offers to do it, and it works after a restart).
 - **Optional warning and beep** 1 minute before, with a Cancel button. Both are off at first.
 - **Sits by the clock** as a small moon icon. Right-click it to turn off, do it now, switch the night light, or exit.
 - **Can start with Windows** (starts turned on).

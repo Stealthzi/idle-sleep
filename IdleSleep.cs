@@ -19,8 +19,8 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("Idle Sleep")]
 [assembly: AssemblyProduct("Idle Sleep")]
-[assembly: AssemblyVersion("2.2.0.0")]
-[assembly: AssemblyFileVersion("2.2.0.0")]
+[assembly: AssemblyVersion("2.3.0.0")]
+[assembly: AssemblyFileVersion("2.3.0.0")]
 
 static class Program
 {
@@ -303,7 +303,7 @@ static class NightFilter
     static readonly Dictionary<string, ushort[]> applied = new Dictionary<string, ushort[]>();
     static readonly Dictionary<string, double> caps = new Dictionary<string, double>(); // warmest a screen allowed
     public static double Level;        // 0 = normal colours, 1 = the chosen strength (it fades in between)
-    public static int Strength = 80;   // 0 to 100 (100 = as warm as Windows allows)
+    public static int Strength = 70;   // 0 to 100, the same scale as Windows' Night light slider
     public static bool Limited;        // Windows would not let a screen go as warm as asked
     public static bool BasesChanged;   // a new normal curve was noted (the file should be saved)
 
@@ -332,15 +332,20 @@ static class NightFilter
     }
 
     // How much green and blue are kept for warm light of this strength (red stays full).
-    // Strength 0 = daylight white (6500 K), 100 = 3300 K: Windows refuses curves that take away more
-    // than half of a colour, and 3300 K keeps just over half of the blue.
+    // The same scale as Windows' Night light: strength 0 = daylight white (6500 K), 100 = 1200 K.
     static double Green(double kelvin) { return 99.4708025861 * Math.Log(kelvin / 100) - 161.1195681661; }
     static double Blue(double kelvin) { return kelvin <= 1900 ? 0 : 138.5177312231 * Math.Log(kelvin / 100 - 10) - 305.0447927307; }
+    static double Kelvin() { return 6500 - Strength / 100.0 * (6500 - 1200); }
+    static double GreenKept() { return Math.Max(0, Math.Min(1, Green(Kelvin()) / Green(6500))); }
+    static double BlueKept() { return Math.Max(0, Math.Min(1, Blue(Kelvin()) / Blue(6500))); }
+
+    // Out of the box Windows refuses curves that take away more than half of a colour, so above about
+    // 60% strength it needs its "gamma range" setting raised first (see GammaRange).
+    public static bool PastWindowsLimit { get { return BlueKept() < 0.5 || GreenKept() < 0.5; } }
 
     static ushort[] Curve(ushort[] bas, double level)
     {
-        double k = 6500 - Strength / 100.0 * (6500 - 3300);
-        double g = Math.Max(0, Math.Min(1, Green(k) / Green(6500))), b = Math.Max(0, Math.Min(1, Blue(k) / Blue(6500)));
+        double g = GreenKept(), b = BlueKept();
         g = 1 - level * (1 - g);
         b = 1 - level * (1 - b);
         var r = new ushort[768];
@@ -382,15 +387,20 @@ static class NightFilter
             if (caps.TryGetValue(dev, out cap) && level > cap) { level = cap; limited = true; }
             ushort[] want = Curve(bas, level);
             if (Same(cur, want)) { applied[dev] = want; continue; }
-            // Windows refuses curves it thinks are too far from normal; then go as warm as it allows.
-            while (!Write(dev, want))
+            // Windows refuses curves it thinks are too far from normal; then find the warmest it allows.
+            // (The last curve that worked is the one left on the screen.)
+            if (!Write(dev, want))
             {
-                level *= 0.85;
+                double lo = 0, hi = level;
+                for (int i = 0; i < 8; i++)
+                {
+                    double mid = (lo + hi) / 2;
+                    if (Write(dev, Curve(bas, mid))) lo = mid; else hi = mid;
+                }
                 limited = true;
-                if (level < 0.05) { want = null; break; }
-                want = Curve(bas, level);
+                caps[dev] = lo;
+                want = lo > 0 ? Curve(bas, lo) : null;
             }
-            if (level < Level) caps[dev] = level;
             if (want != null) applied[dev] = want;
         }
         if (Level <= 0) applied.Clear();
@@ -399,6 +409,38 @@ static class NightFilter
 
     // A new strength may be allowed further than the old one was.
     public static void StrengthChanged() { caps.Clear(); }
+
+    // The strength set on Windows' own Night light slider, used as Idle Sleep's starting strength.
+    // Windows keeps it in a CloudStore setting as a colour temperature (field CF 28, a zigzag varint).
+    public static int WindowsStrength(int fallback)
+    {
+        try
+        {
+            using (var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\" +
+                @"default$windows.data.bluelightreduction.settings\windows.data.bluelightreduction.settings"))
+            {
+                var d = k == null ? null : k.GetValue("Data") as byte[];
+                if (d == null) return fallback;
+                for (int i = 19; i + 3 < d.Length; i++)
+                {
+                    if (d[i] != 0xCF || d[i + 1] != 0x28) continue;
+                    long v = 0;
+                    int shift = 0, j = i + 2;
+                    while (j < d.Length && shift < 35)
+                    {
+                        v |= (long)(d[j] & 0x7F) << shift;
+                        shift += 7;
+                        if ((d[j++] & 0x80) == 0) break;
+                    }
+                    long kelvin = v >> 1;
+                    if (kelvin < 1000 || kelvin > 6600) return fallback;
+                    return Math.Max(5, Math.Min(100, (int)Math.Round((6500 - kelvin) / 53.0)));
+                }
+            }
+        }
+        catch { }
+        return fallback;
+    }
 
     // Normal colours on every screen Idle Sleep warmed (on Exit, and if the program is stopped).
     public static void Restore()
@@ -429,6 +471,41 @@ static class NightFilter
             return r;
         }
         catch { return null; }
+    }
+}
+
+// Windows' "gamma range" setting. Out of the box it stops programs taking away more than half of a
+// colour; 256 lifts that (the same setting f.lux's "Expand range" uses). Windows reads it when it
+// starts, so a change only counts after a restart.
+static class GammaRange
+{
+    const string Key = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ICM";
+
+    public static bool Raised
+    {
+        get
+        {
+            try
+            {
+                using (var k = Registry.LocalMachine.OpenSubKey(Key))
+                {
+                    object v = k == null ? null : k.GetValue("GdiIcmGammaRange");
+                    return v is int && (int)v >= 256;
+                }
+            }
+            catch { return false; }
+        }
+    }
+
+    public static bool Raise()
+    {
+        try
+        {
+            using (var k = Registry.LocalMachine.CreateSubKey(Key))
+                k.SetValue("GdiIcmGammaRange", 256, RegistryValueKind.DWord);
+            return Raised;
+        }
+        catch { return false; }
     }
 }
 
@@ -592,7 +669,8 @@ static class Theme
             b.ForeColor = Text;
             return;
         }
-        if (c is ComboBox) ((ComboBox)c).FlatStyle = FlatStyle.Flat;
+        // Flat looks right on dark cards; on white cards a flat list box has no visible edge, so light mode uses the normal one.
+        if (c is ComboBox) ((ComboBox)c).FlatStyle = Dark ? FlatStyle.Flat : FlatStyle.Standard;
         if (c is NumericUpDown || c is ComboBox)
         {
             c.BackColor = Input;
@@ -845,6 +923,7 @@ class Settings
     public int RandomMinMinutes = 60;  // shortest random wait (1 hour)
     public int RandomMaxMinutes = 300; // longest random wait (5 hours)
     public bool RandomInHours = true;  // the range is shown in hours (true) or minutes (false)
+    public bool FixedInHours = false;  // the set time is shown in hours (true) or minutes (false)
     // Warning and beep are off by default: usually the person is asleep.
     public bool Warn = false;
     public bool Beep = false;
@@ -867,7 +946,7 @@ class Settings
     public int WowLoginMinutes = 10;
     // Night light: switch it on and off by itself at the times learned from you, and how warm.
     public bool NightAuto = true;
-    public int NightStrength = 80;
+    public int NightStrength = NightFilter.WindowsStrength(70); // at first: the same as Windows' Night light
 
     public Settings() { OledRecommended(); }
 
@@ -902,7 +981,8 @@ class Settings
                 string key = line.Substring(0, eq).Trim(), val = line.Substring(eq + 1).Trim();
                 int n;
                 if (key == "Enabled") s.Enabled = val == "1";
-                else if (key == "Minutes" && int.TryParse(val, out n)) s.Minutes = Math.Max(1, Math.Min(720, n));
+                else if (key == "Minutes" && int.TryParse(val, out n)) s.Minutes = Math.Max(1, Math.Min(1440, n));
+                else if (key == "MinutesUnit") s.FixedInHours = val == "hours";
                 else if (key == "Action" && int.TryParse(val, out n)) s.Action = Math.Max(0, Math.Min(4, n));
                 else if (key == "ForceClose") s.ForceClose = val == "1";
                 else if (key == "RandomTime") s.RandomTime = val == "1";
@@ -964,6 +1044,7 @@ class Settings
                 "RandomTime=" + (RandomTime ? "1" : "0"),
                 "RandomMinMinutes=" + RandomMinMinutes,
                 "RandomMaxMinutes=" + RandomMaxMinutes,
+                "MinutesUnit=" + (FixedInHours ? "hours" : "minutes"),
                 "RandomUnit=" + (RandomInHours ? "hours" : "minutes"),
                 "Warn=" + (Warn ? "1" : "0"),
                 "Beep=" + (Beep ? "1" : "0"),
@@ -1292,7 +1373,7 @@ class OledForm : Form
 
 class MainForm : Form
 {
-    public const string Version = "2.2"; // keep in step with AssemblyVersion at the top
+    public const string Version = "2.3"; // keep in step with AssemblyVersion at the top
     const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
     const string RunName = "IdleSleep";
 
@@ -1309,11 +1390,11 @@ class MainForm : Form
     RadioButton[] radAction;
     Button btnNow, btnTheme;
     float dpiScale = 1f;
-    NumericUpDown numMin;
-    CheckBox chkRandom;
-    FlowLayoutPanel timeRow, randRow;
+    NumericUpDown numMin;                 // the set time, in minutes or hours
+    RadioButton radFixed, radRandom;      // a set time or a random one
     NumericUpDown numRandMin, numRandMax; // random range, in minutes or hours
-    ComboBox cmbRandUnit;
+    ComboBox cmbFixedUnit, cmbRandUnit;
+    Label lblRandTo, lblWhen;
     Random rng = new Random();
     uint randomLimitMs, lastIdleMs; // the hidden random wait, and last tick's idle time
     Label lblStatus;
@@ -1378,12 +1459,13 @@ class MainForm : Form
 
         loading = true;
         chkOn.Checked = settings.Enabled;
-        numMin.Value = settings.Minutes;
+        cmbFixedUnit.SelectedIndex = settings.FixedInHours ? 1 : 0;
+        SetFixedUnit(settings.FixedInHours);
         radAction[settings.Action].Checked = true;
         chkForce.Checked = settings.ForceClose;
         cmbRandUnit.SelectedIndex = settings.RandomInHours ? 1 : 0;
         SetRandUnit(settings.RandomInHours);
-        chkRandom.Checked = settings.RandomTime;
+        if (settings.RandomTime) radRandom.Checked = true; else radFixed.Checked = true;
         chkWarn.Checked = settings.Warn;
         chkBeep.Checked = settings.Beep;
         chkMouse.Checked = settings.CountMouse;
@@ -1474,9 +1556,17 @@ class MainForm : Form
         cols.Controls.Add(right, 1, 0);
         root.Controls.Add(cols);
 
-        // What to do. Radio buttons in one panel = only one can be chosen.
+        // When nobody uses the PC: what to do and after how long, in one grid so the boxes line up.
+        //   Do this   (o) Sleep  ( ) Hibernate  ( ) Shut down  ( ) Restart  ( ) Lock
+        //   After     (o) A set time      [ 12 ]              [minutes]
+        //             ( ) A random time   [1.5 ]  to  [3.0 ]  [hours  ]
         var cardDo = new Card();
-        cardDo.Controls.Add(Heading("WHEN NOBODY USES THE PC, DO THIS"));
+        cardDo.Controls.Add(Heading("WHEN NOBODY USES THE PC"));
+        var when = new TableLayoutPanel { ColumnCount = 6, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0) };
+        for (int i = 0; i < 6; i++) when.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        var lead = new Padding(0, S(4), S(12), S(4));
+
+        when.Controls.Add(new Label { Text = "Do this", AutoSize = true, Tag = "sub", Anchor = AnchorStyles.Left, Margin = lead }, 0, 0);
         var actionRow = Row();
         radAction = new RadioButton[ActionNames.Length];
         for (int i = 0; i < ActionNames.Length; i++)
@@ -1486,40 +1576,40 @@ class MainForm : Form
             radAction[i] = rb;
             actionRow.Controls.Add(rb);
         }
-        cardDo.Controls.Add(actionRow);
-        chkForce = new CheckBox { Text = "Force programs to close (unsaved work is lost)", AutoSize = true, Margin = new Padding(0, S(4), 0, 0) };
+        when.Controls.Add(actionRow, 1, 0);
+        when.SetColumnSpan(actionRow, 5);
+        chkForce = new CheckBox { Text = "Force programs to close (unsaved work is lost)", AutoSize = true, Margin = new Padding(0, 0, 0, S(4)) };
         chkForce.CheckedChanged += delegate { Apply(); };
-        cardDo.Controls.Add(chkForce);
-        left.Controls.Add(cardDo);
+        when.Controls.Add(chkForce, 1, 1);
+        when.SetColumnSpan(chkForce, 5);
 
-        // How long.
-        var cardTime = new Card();
-        cardTime.Controls.Add(Heading("HOW LONG"));
-        timeRow = Row();
-        timeRow.Controls.Add(new Label { Text = "After", AutoSize = true, Anchor = AnchorStyles.Left });
-        numMin = new NumericUpDown { Minimum = 1, Maximum = 720, Width = S(70), Anchor = AnchorStyles.Left };
+        // A set time or a random one: pick one. The row not picked is locked.
+        var box = new Padding(0, S(3), S(6), S(3));
+        when.Controls.Add(new Label { Text = "After", AutoSize = true, Tag = "sub", Anchor = AnchorStyles.Left, Margin = lead }, 0, 2);
+        radFixed = new RadioButton { Text = "A set time", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, S(3), S(10), S(3)) };
+        radRandom = new RadioButton { Text = "A random time", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, S(3), S(10), S(3)) };
+        radRandom.CheckedChanged += delegate { UpdateWhen(); Apply(); };
+        numMin = new NumericUpDown { Width = S(62), Anchor = AnchorStyles.Left, Margin = box };
         numMin.ValueChanged += delegate { Apply(); };
-        timeRow.Controls.Add(numMin);
-        timeRow.Controls.Add(new Label { Text = "minutes of no use", AutoSize = true, Anchor = AnchorStyles.Left });
-        cardTime.Controls.Add(timeRow);
+        cmbFixedUnit = UnitBox();
+        cmbFixedUnit.SelectedIndexChanged += delegate
+        {
+            if (loading) return;
+            settings.FixedInHours = cmbFixedUnit.SelectedIndex == 1;
+            SetFixedUnit(settings.FixedInHours);
+            Apply();
+        };
+        when.Controls.Add(radFixed, 1, 2);
+        when.Controls.Add(numMin, 2, 2);
+        when.Controls.Add(cmbFixedUnit, 5, 2);
 
-        chkRandom = new CheckBox { Text = "Use a random time instead (not shown)", AutoSize = true, Margin = new Padding(0, S(6), 0, 0) };
-        chkRandom.CheckedChanged += delegate { UpdateTimeRows(); Apply(); };
-        cardTime.Controls.Add(chkRandom);
-
-        randRow = Row();
-        randRow.Margin = new Padding(S(18), S(2), 0, 0);
-        randRow.Controls.Add(new Label { Text = "Between", AutoSize = true, Anchor = AnchorStyles.Left });
-        numRandMin = new NumericUpDown { Width = S(62), Anchor = AnchorStyles.Left };
-        numRandMax = new NumericUpDown { Width = S(62), Anchor = AnchorStyles.Left };
+        numRandMin = new NumericUpDown { Width = S(62), Anchor = AnchorStyles.Left, Margin = box };
+        numRandMax = new NumericUpDown { Width = S(62), Anchor = AnchorStyles.Left, Margin = box };
         // Keep the shortest from going above the longest.
         numRandMin.ValueChanged += delegate { if (!loading && numRandMin.Value > numRandMax.Value) numRandMax.Value = numRandMin.Value; Apply(); };
         numRandMax.ValueChanged += delegate { if (!loading && numRandMax.Value < numRandMin.Value) numRandMin.Value = numRandMax.Value; Apply(); };
-        randRow.Controls.Add(numRandMin);
-        randRow.Controls.Add(new Label { Text = "and", AutoSize = true, Anchor = AnchorStyles.Left });
-        randRow.Controls.Add(numRandMax);
-        cmbRandUnit = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = S(88), Anchor = AnchorStyles.Left };
-        cmbRandUnit.Items.AddRange(new object[] { "minutes", "hours" });
+        lblRandTo = new Label { Text = "to", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, S(3), S(6), S(3)) };
+        cmbRandUnit = UnitBox();
         cmbRandUnit.SelectedIndexChanged += delegate
         {
             if (loading) return;
@@ -1527,9 +1617,20 @@ class MainForm : Form
             SetRandUnit(settings.RandomInHours);
             Apply();
         };
-        randRow.Controls.Add(cmbRandUnit);
-        cardTime.Controls.Add(randRow);
-        left.Controls.Add(cardTime);
+        when.Controls.Add(radRandom, 1, 3);
+        when.Controls.Add(numRandMin, 2, 3);
+        when.Controls.Add(lblRandTo, 3, 3);
+        when.Controls.Add(numRandMax, 4, 3);
+        when.Controls.Add(cmbRandUnit, 5, 3);
+
+        var note = new Label { Text = "A new random time is picked each time, and it isn't shown.", AutoSize = true, Tag = "sub", Margin = new Padding(0, 0, 0, S(2)) };
+        when.Controls.Add(note, 1, 4);
+        when.SetColumnSpan(note, 5);
+        cardDo.Controls.Add(when);
+        // In plain words: "The PC will fall asleep after 12 minutes of no use."
+        lblWhen = new Label { AutoSize = true, Margin = new Padding(0, S(6), 0, 0) };
+        cardDo.Controls.Add(lblWhen);
+        left.Controls.Add(cardDo);
 
         // What counts as use, all on one line.
         var cardUse = new Card();
@@ -1621,6 +1722,14 @@ class MainForm : Form
         lblNightStrength = new Label { AutoSize = true, Anchor = AnchorStyles.Left };
         strengthRow.Controls.Add(lblNightStrength);
         cardNight.Controls.Add(strengthRow);
+        // Shown when the strength is past what Windows lets programs do out of the box.
+        nightLimitRow = Row();
+        nightLimitRow.Margin = new Padding(0, S(2), 0, S(2));
+        lblNightLimit = new Label { AutoSize = true, Tag = "sub", Anchor = AnchorStyles.Left, Margin = new Padding(0, 0, S(8), 0) };
+        nightLimitRow.Controls.Add(lblNightLimit);
+        btnNightLimit = MakeButton("Allow full strength", delegate { AllowFullStrength(); });
+        nightLimitRow.Controls.Add(btnNightLimit);
+        cardNight.Controls.Add(nightLimitRow);
         lblNight = new Label { AutoSize = true, Margin = new Padding(0, S(4), 0, 0) };
         cardNight.Controls.Add(lblNight);
         lblNightLearned = new Label { AutoSize = true, Tag = "sub", Margin = new Padding(0, S(2), 0, 0) };
@@ -1698,12 +1807,45 @@ class MainForm : Form
 
     static decimal Fit(NumericUpDown n, decimal v) { return Math.Max(n.Minimum, Math.Min(n.Maximum, v)); }
 
-    // The row not in use is shown in a softer colour (not greyed out, so it stays easy to read and change).
-    void UpdateTimeRows()
+    // The same for the set time: minutes, or hours in half-hour steps (up to 24 hours either way).
+    void SetFixedUnit(bool hours)
     {
-        bool random = chkRandom.Checked;
-        foreach (Control c in timeRow.Controls) c.ForeColor = random ? Theme.Sub : Theme.Text;
-        foreach (Control c in randRow.Controls) c.ForeColor = random ? Theme.Text : Theme.Sub;
+        bool was = loading;
+        loading = true;
+        if (hours) { numMin.DecimalPlaces = 1; numMin.Increment = 0.5m; numMin.Minimum = 0.1m; numMin.Maximum = 24m; }
+        else { numMin.DecimalPlaces = 0; numMin.Increment = 1m; numMin.Minimum = 1m; numMin.Maximum = 1440m; }
+        numMin.Value = Fit(numMin, Math.Round(settings.Minutes / (hours ? 60m : 1m), 1));
+        loading = was;
+    }
+
+    ComboBox UnitBox()
+    {
+        var c = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = S(88), Anchor = AnchorStyles.Left, Margin = new Padding(0, S(3), 0, S(3)) };
+        c.Items.AddRange(new object[] { "minutes", "hours" });
+        return c;
+    }
+
+    // The row not picked is locked, and the line under the boxes says what will happen in plain words.
+    void UpdateWhen()
+    {
+        bool random = radRandom.Checked;
+        numMin.Enabled = cmbFixedUnit.Enabled = !random;
+        numRandMin.Enabled = numRandMax.Enabled = cmbRandUnit.Enabled = random;
+        lblRandTo.ForeColor = random ? Theme.Text : Theme.Sub;
+        string when = random
+            ? string.Format("a random {0} to {1}", Amount(settings.RandomMinMinutes, settings.RandomInHours, false),
+                                                   Amount(settings.RandomMaxMinutes, settings.RandomInHours, true))
+            : Amount(settings.Minutes, settings.FixedInHours, true);
+        lblWhen.Text = "The PC will " + ActionPhrases[GetAction()] + " after " + when + " of no use.";
+    }
+
+    // "12 minutes", "1 hour", "1.5 hours"; unit = false leaves the unit off ("1.5" in "1.5 to 3 hours").
+    static string Amount(int minutes, bool hours, bool unit)
+    {
+        decimal n = hours ? Math.Round(minutes / 60m, 1) : minutes;
+        string num = n.ToString("0.#");
+        if (!unit) return num;
+        return num + " " + (hours ? (n == 1 ? "hour" : "hours") : (n == 1 ? "minute" : "minutes"));
     }
 
     void OpenOled()
@@ -1789,7 +1931,7 @@ class MainForm : Form
     {
         SuspendLayout();
         Theme.Apply(this, Theme.Back);
-        UpdateTimeRows();
+        UpdateWhen();
         UpdateWowRows();
         ResumeLayout();
         btnTheme.Text = Theme.Dark ? "Light mode" : "Dark mode";
@@ -1858,10 +2000,10 @@ class MainForm : Form
     {
         if (loading) return;
         settings.Enabled = chkOn.Checked;
-        settings.Minutes = (int)numMin.Value;
+        settings.Minutes = Math.Max(1, Math.Min(1440, (int)Math.Round(numMin.Value * (settings.FixedInHours ? 60m : 1m))));
         settings.Action = GetAction();
         settings.ForceClose = chkForce.Checked;
-        settings.RandomTime = chkRandom.Checked;
+        settings.RandomTime = radRandom.Checked;
         decimal per = settings.RandomInHours ? 60m : 1m;
         int rMin = Math.Max(1, (int)Math.Round(numRandMin.Value * per)), rMax = Math.Max(1, (int)Math.Round(numRandMax.Value * per));
         bool rangeChanged = rMin != settings.RandomMinMinutes || rMax != settings.RandomMaxMinutes;
@@ -1882,6 +2024,7 @@ class MainForm : Form
         settings.NightAuto = chkNightAuto.Checked;
         menuNightAuto.Checked = settings.NightAuto;
         settings.Save();
+        UpdateWhen();
         OnTick();
     }
 
@@ -2464,7 +2607,10 @@ class MainForm : Form
     Button btnNight;
     CheckBox chkNightAuto;
     TrackBar trkNight;
-    Label lblNight, lblNightLearned, lblNightStrength;
+    Label lblNight, lblNightLearned, lblNightStrength, lblNightLimit;
+    FlowLayoutPanel nightLimitRow;
+    Button btnNightLimit;
+    bool gammaRaised = GammaRange.Raised;
     ToolStripMenuItem menuNight, menuNightAuto;
 
     static readonly TimeSpan NightBreak = TimeSpan.FromHours(5);   // a break this long can start a new day...
@@ -2575,6 +2721,26 @@ class MainForm : Form
         UpdateNightText(now);
     }
 
+    // Lifts Windows' limit on how warm programs can make the screen (asks first; needs a restart).
+    void AllowFullStrength()
+    {
+        if (MessageBox.Show(
+                "Out of the box, Windows stops programs from making the screen warmer than about 60%.\n\n" +
+                "Idle Sleep can lift that by changing one Windows setting (GdiIcmGammaRange, the same one " +
+                "f.lux's \"Expand range\" uses). It takes effect after you restart the PC.\n\nChange it now?",
+                "Idle Sleep", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        if (!selfElevated)
+            MessageBox.Show("Idle Sleep needs to run as administrator to change this.", "Idle Sleep");
+        else if (GammaRange.Raise())
+        {
+            gammaRaised = true;
+            Log("Night light: Windows' gamma range set to 256 (full strength after a restart)");
+            MessageBox.Show("Done. Restart the PC and the night light can go to full strength.", "Idle Sleep");
+        }
+        else MessageBox.Show("Windows would not let Idle Sleep change the setting.", "Idle Sleep");
+        UpdateNightText(DateTime.UtcNow);
+    }
+
     void NightStrengthChanged()
     {
         lblNightStrength.Text = trkNight.Value + "%";
@@ -2616,7 +2782,13 @@ class MainForm : Form
             else s = left.TotalMinutes >= 1 ? "Off. Comes on by itself in about " + Span(left) + "." : "Off. Coming on now.";
         }
         else s = "Off for the rest of today. It comes on again in your next day.";
-        if (NightFilter.Limited && night.On) s += "\nA screen won't go this warm, so it is as warm as it allows.";
+        // Past Windows' limit: offer to lift it; once lifted, it only counts after a restart.
+        bool showLimit = NightFilter.PastWindowsLimit && (!gammaRaised || NightFilter.Limited);
+        if (nightLimitRow.Visible != showLimit) nightLimitRow.Visible = showLimit;
+        string lim = gammaRaised ? "Restart the PC to use this strength. Until then it's as strong as Windows allows."
+                                 : "Windows holds programs back above about 60%.";
+        if (lblNightLimit.Text != lim) lblNightLimit.Text = lim;
+        if (btnNightLimit.Visible == gammaRaised) btnNightLimit.Visible = !gammaRaised;
         if (lblNight.Text != s) lblNight.Text = s;
 
         string l = "Comes on " + Span(TimeSpan.FromMinutes(OnMinutes())) + " into your day"
