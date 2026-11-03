@@ -14,10 +14,20 @@ don't have to remember to do it.
 - **Works while games and programs are open.** Leave a game running, walk away, and the PC still goes to sleep.
 - **Pick one action:** Sleep, Hibernate, Shut down, Restart or Lock.
 - **You choose the time.** For example 30 minutes of no use.
-- **Random time (optional).** Pick a random wait between two numbers of hours (for example 1 to 5). It does not show how long is left.
+- **Random time (optional).** Pick a random wait between two numbers, in minutes or hours (for example 1 to 5 hours). It does not show how long is left.
 - **You choose what counts as using the PC:** Mouse, Keyboard and/or Xbox-style game controller. For example, tick only the mouse and typing won't stop it.
+- **OLED mode (optional).** A button that opens all the burn-in protection in one place, with the helpful options
+  ticked for you: black screen saver after 5 minutes of no use, screen off after 10, screen off when the PC is
+  locked, hide a still mouse pointer. Also: hide the taskbar while you're away, black out a screen the mouse hasn't
+  been on, and a break reminder. Using the PC again puts everything back the way it was. Works even when the main timer is off.
+- **Close World of Warcraft (optional)** after a while with no use, or after a while stuck at the login screen
+  (for example after a disconnect), with a 1-minute warning and Cancel.
+- **Night light that learns (optional, on at first).** Warmer screen colours in the evening, made by Idle Sleep
+  itself (Windows 11 26H2 no longer lets programs switch Windows' own Night light). It comes on and goes off at the
+  average of your last 7 times, counted from when your day starts (coming back after 5+ hours away), not from the
+  clock, so the PC's time zone doesn't matter. There's also a button to switch it straight away, and a strength slider.
 - **Optional warning and beep** 1 minute before, with a Cancel button. Both are off at first.
-- **Sits by the clock** as a small moon icon. Right-click it to turn off, do it now, or exit.
+- **Sits by the clock** as a small moon icon. Right-click it to turn off, do it now, switch the night light, or exit.
 - **Can start with Windows** (starts turned on).
 - Small, free, no install, no internet, no tracking.
 
@@ -43,7 +53,10 @@ Click **More info** then **Run anyway**. The full source code is in this repo if
 - **Controllers:** only Xbox-style controllers count as "using the PC". If you play with another kind, untick the
   controller option or turn Idle Sleep off while you play.
 - **Some laptops:** Windows may hibernate instead of doing a normal sleep on some laptops. Hibernate still saves power.
-- Settings are saved in `IdleSleep-settings.txt` next to the program. `IdleSleep-log.txt` lists what it did and when.
+- **Night light:** leave Windows' own Night light off, or the two add up. Some games in true fullscreen reset the
+  colours; the warmth comes back within a few seconds. With HDR on, the warmth doesn't show.
+- Settings are saved in `IdleSleep-settings.txt` next to the program, what the night light has learned in
+  `IdleSleep-nightlight.txt`. `IdleSleep-log.txt` lists what it did and when.
 
 ## Build it yourself
 
